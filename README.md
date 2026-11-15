@@ -1,109 +1,70 @@
 # backup-exporter
 
-backup-exporter exposes [Borg](https://borgbackup.readthedocs.io/) and [restic](https://restic.net/) backup
-metrics to be scraped by Prometheus.  
-It parses the result of `borg info` and `restic snapshots`/`restic stats` for the repositories listed in its
-config file.
+A Prometheus exporter for your [Borg](https://borgbackup.readthedocs.io/) and [restic](https://restic.net/)
+backups. Point it at your repositories and it tells you, through Prometheus and Grafana:
 
-## Metrics
+- when each repository was last backed up, so you can alert on stale backups
+- how big each backup is, how many files it holds and how long it took
+- how much new data each backup added, and (for Borg) how much space the whole repository uses on disk
+- whether the exporter itself is managing to read your repositories
 
-### Borg
+It works by periodically running `borg info` and `restic snapshots`/`restic stats` against the repositories
+listed in its config file, and serving the results on a `/metrics` endpoint.
 
-| Name                                       | Description                                     | Type  |
-|--------------------------------------------|-------------------------------------------------|-------|
-| `borg_last_backup_duration_seconds`        | Duration of the last backup in seconds          | Gauge |
-| `borg_last_backup_compressed_size_bytes`   | Compressed size of the last backup in bytes     | Gauge |
-| `borg_last_backup_deduplicated_size_bytes` | Deduplicated size of the last backup in bytes** | Gauge |
-| `borg_last_backup_files`                   | Number of files in the last backup              | Gauge |
-| `borg_last_backup_original_size_bytes`     | Original size of the last backup in bytes       | Gauge |
-| `borg_last_backup_timestamp`               | Timestamp of the last backup (unix epoch*)      | Gauge |
-| `borg_archive_duration_seconds`            | Duration of the archive's backup in seconds     | Gauge |
-| `borg_archive_compressed_size_bytes`       | Compressed size of the archive in bytes         | Gauge |
-| `borg_archive_deduplicated_size_bytes`     | Deduplicated size of the archive in bytes**     | Gauge |
-| `borg_archive_files`                       | Number of files in the archive                  | Gauge |
-| `borg_archive_original_size_bytes`         | Original size of the archive in bytes           | Gauge |
-| `borg_archive_timestamp`                   | Timestamp of the archive's backup (unix epoch*) | Gauge |
-| `borg_total_chunks`                        | Repository total chunks                         | Gauge |
-| `borg_total_compressed_size_bytes`         | Repository total compressed size                | Gauge |
-| `borg_total_size_bytes`                    | Repository total size                           | Gauge |
-| `borg_total_unique_chunks`                 | Repository total unique chunks                  | Gauge |
-| `borg_deduplicated_compressed_size_bytes`  | Repository deduplicated compressed size         | Gauge |
-| `borg_deduplicated_size_bytes`             | Repository deduplicated size                    | Gauge |
-| `borg_last_archive_info`                   | Information about the last backup archive       | Gauge |
-| `borg_repository_info`                     | Information about the backup repository         | Gauge |
+![Grafana Dashboard](./dashboards/grafana-exporter-dashboard.png)
 
-\* number of seconds that have elapsed since January 1, 1970  
-\*\* this is *not* "the size of this backup after deduplication". Borg computes it as the data
-that is exclusively owned by this one archive relative to the repository's current state (i.e.
-what would be freed if you deleted just this archive) — it is order-dependent and can read `0`
-for a large, valid backup if its content duplicates another archive already in the repository, and
-can change for an older archive once newer archives are created. See the
-[borg documentation](https://borgbackup.readthedocs.io/en/stable/usage/info.html) for details.
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [Running it as a service](#running-it-as-a-service)
+- [Prometheus](#prometheus)
+- [Alerting](#alerting)
+- [Grafana dashboards](#grafana-dashboards)
+- [Metrics](#metrics)
+- [How collection works](#how-collection-works)
+- [Migrating from borg-exporter](#migrating-from-borg-exporter)
+- [Development and releases](#development-and-releases)
 
-Each of these metrics is labeled by `repository`. The `borg_archive_*` metrics are additionally labeled by
-`archive` (the archive name), and are exposed for the last `N` archives of each repository, `N` being
-configurable via `ARCHIVE_HISTORY_LIMIT` (default 10) — see [Configuration](#configuration). This includes
-archives that predate the exporter tracking a repository, unlike the `borg_last_backup_*` metrics which only
-reflect what Prometheus has scraped over time.
+## Quick start
 
-### Restic
+1. Download the latest `backup-exporter-<version>-linux-amd64.tar.gz` from the
+   [releases page](https://github.com/lefeverd/backup-exporter/releases), and extract the binary to
+   `/usr/local/bin/backup-exporter`.
 
-| Name                                         | Description                                                     | Type  |
-|----------------------------------------------|-----------------------------------------------------------------|-------|
-| `restic_last_backup_duration_seconds`        | Duration of the last backup in seconds***                       | Gauge |
-| `restic_last_backup_original_size_bytes`     | Original (restore) size of the last backup in bytes             | Gauge |
-| `restic_last_backup_files`                   | Number of files in the last backup                              | Gauge |
-| `restic_last_backup_timestamp`               | Timestamp of the last backup (unix epoch*)                      | Gauge |
-| `restic_last_backup_data_added_bytes`        | Uncompressed data added to the repository by the last backup*** | Gauge |
-| `restic_last_backup_data_added_packed_bytes` | Compressed data added to the repository by the last backup***   | Gauge |
-| `restic_archive_duration_seconds`            | Duration of the snapshot's backup in seconds***                 | Gauge |
-| `restic_archive_original_size_bytes`         | Original (restore) size of the snapshot in bytes                | Gauge |
-| `restic_archive_files`                       | Number of files in the snapshot                                 | Gauge |
-| `restic_archive_timestamp`                   | Timestamp of the snapshot's backup (unix epoch*)                | Gauge |
-| `restic_archive_data_added_bytes`            | Uncompressed data added to the repository by this snapshot***   | Gauge |
-| `restic_archive_data_added_packed_bytes`     | Compressed data added to the repository by this snapshot***     | Gauge |
-| `restic_last_snapshot_info`                  | Information about the last backup snapshot                      | Gauge |
+2. Create a config file listing your repositories, e.g. `/etc/backup-exporter/config.yaml`:
 
-\* number of seconds that have elapsed since January 1, 1970  
-\*\*\* restic only records this data (its snapshot "summary" block) from a version recent enough to capture
-it. Snapshots taken by an older restic — including ones that already existed before you upgraded — simply
-won't have these series; the exporter doesn't fake a `0`, it leaves them unset.
+   ```yaml
+   repositories:
+     - name: home
+       type: borg
+       path: ssh://my-repository/backups/my-machine
 
-Each of these metrics is labeled by `repository`. The `restic_archive_*` metrics are additionally labeled by
-`snapshot` (the short snapshot ID), and are exposed for the last `N` snapshots of each repository, `N` being
-shared with Borg's `ARCHIVE_HISTORY_LIMIT`.
+     - name: photos
+       type: restic
+       repository: sftp:user@host:/path/to/repo
+       password_command: "pass show restic/photos"
+   ```
 
-There's no restic equivalent of Borg's chunk-level dedup stats (`borg_total_chunks` and friends) or repository
-info — restic's CLI doesn't expose them per-repository, so those are simply not present for restic rather than
-faked with an approximation.
+3. Run it as the user that owns your backups (see [User and permissions](#user-and-permissions)):
 
-`restic_*_original_size_bytes`/`files` come from `restic stats <snapshot> --mode restore-size`, which is a
-separate, comparatively slow command per snapshot (especially over a WAN/SFTP backend). To keep collection
-cheap, the exporter caches these per snapshot across cycles and only recomputes them for snapshots it hasn't
-seen before, plus the latest snapshot every cycle (older snapshots' sizes don't change). It self-heals this
-cache against `forget`/`prune` on the repository — a snapshot ID that disappears from `restic snapshots` is
-dropped from the cache too.
+   ```
+   backup-exporter -config /etc/backup-exporter/config.yaml
+   ```
 
-### Exporter (shared across tools)
+4. After the first collection (which can take a few minutes), check the metrics:
 
-| Name                                     | Description                                           | Type    |
-|------------------------------------------|-------------------------------------------------------|---------|
-| `exporter_collect_errors`                | Number of errors encountered while collecting metrics | Counter |
-| `exporter_last_collect_error`            | 1 if the last collection failed, 0 if successful      | Gauge   |
-| `exporter_last_collect_duration_seconds` | Duration of the last metrics collection               | Gauge   |
-| `exporter_last_collect_timestamp`        | Timestamp of the last metrics collection              | Gauge   |
-| `exporter_system_info`                   | Information about a configured backup tool            | Gauge   |
+   ```
+   curl 127.0.0.1:9099/metrics
+   ```
 
-These describe the exporter's own operation rather than backup domain data, so they're shared across every
-configured tool instead of duplicated per tool. They're labeled by `tool` (`borg` or `restic`) and
-`repository`, except `exporter_system_info` which is labeled by `tool`, `hostname` and `version`.
+Then [run it as a service](#running-it-as-a-service), [add it to Prometheus](#prometheus) and
+[import the dashboards](#grafana-dashboards).
 
 ## Configuration
 
-### Repositories: YAML config file
+### Repositories
 
-The list of repositories to collect metrics for is defined in a YAML file, passed via `-config` or
-`CONFIG_FILE`. It supports a mix of `borg` and `restic` entries:
+The repositories to collect metrics for are listed in a YAML file, passed with `-config` or `CONFIG_FILE`.
+You can mix `borg` and `restic` entries:
 
 ```yaml
 repositories:
@@ -122,67 +83,38 @@ repositories:
 ```
 
 `password` mirrors restic's own `RESTIC_PASSWORD` convention and is supported for compatibility with existing
-restic setups, but is discouraged — the exporter logs a warning on startup for any restic repository using it.
+restic setups, but is discouraged: the exporter logs a warning on startup for any restic repository using it.
 
-### Exporter settings: flags or environment variables
+### Exporter settings
 
-Everything else is configured by flags or environment variables:
+Everything else is set with flags or environment variables. Only the config file is required.
 
-| Environment variable       | Flag                        | Description                                                                                                 | Required | Default    |
-|----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------------|----------|------------|
-| `CONFIG_FILE`              | `-config`                   | Path to the YAML repositories config file (see above)                                                       | `yes`    | ``         |
-| `LISTEN_ADDRESS`           | `-listen-address`           | Address on which the server is to listen for connections                                                    |          | `:9099`    |
-| `METRICS_PATH`             | `-metrics-path`             | Path on which the server exposes the metrics                                                                |          | `/metrics` |
-| `BORG_REFRESH_INTERVAL`    | `-borg-refresh-interval`    | Frequency at which borg metrics are refreshed                                                               |          | `4h`       |
-| `RESTIC_REFRESH_INTERVAL`  | `-restic-refresh-interval`  | Frequency at which restic metrics are refreshed                                                             |          | `4h`       |
-| `SCHEDULER_CHECK_INTERVAL` | `-scheduler-check-interval` | Frequency at which each scheduler checks if its metrics need to be refreshed                                |          | `20s`      |
-| `COMMAND_TIMEOUT`          | `-command-timeout`          | Timeout for a full collection cycle (all repositories of one tool)                                          |          | `120s`     |
-| `BORG_PATH`                | `-borg-path`                | Path to the borg binary                                                                                     |          | `borg`     |
-| `RESTIC_PATH`              | `-restic-path`              | Path to the restic binary                                                                                   |          | `restic`   |
-| `LOG_LEVEL`                | `-log-level`                | Logging level (debug, info, warn, error)                                                                    |          | `info`     |
-| `ARCHIVE_HISTORY_LIMIT`    | `-archive-history-limit`    | Number of most recent archives/snapshots to expose `*_archive_*` per-item metrics for, shared by both tools |          | `10`       |
+| Environment variable       | Flag                        | Description                                                                             | Default    |
+|----------------------------|-----------------------------|-----------------------------------------------------------------------------------------|------------|
+| `CONFIG_FILE`              | `-config`                   | Path to the YAML repositories config file (**required**)                                |            |
+| `LISTEN_ADDRESS`           | `-listen-address`           | Address the server listens on                                                           | `:9099`    |
+| `METRICS_PATH`             | `-metrics-path`             | Path the metrics are served on                                                          | `/metrics` |
+| `BORG_REFRESH_INTERVAL`    | `-borg-refresh-interval`    | How often borg metrics are refreshed                                                    | `4h`       |
+| `RESTIC_REFRESH_INTERVAL`  | `-restic-refresh-interval`  | How often restic metrics are refreshed                                                  | `4h`       |
+| `SCHEDULER_CHECK_INTERVAL` | `-scheduler-check-interval` | How often each scheduler checks whether a refresh is due                                | `20s`      |
+| `COMMAND_TIMEOUT`          | `-command-timeout`          | Timeout for a full collection cycle (all repositories of one tool)                      | `120s`     |
+| `BORG_PATH`                | `-borg-path`                | Path to the borg binary                                                                 | `borg`     |
+| `RESTIC_PATH`              | `-restic-path`              | Path to the restic binary                                                               | `restic`   |
+| `LOG_LEVEL`                | `-log-level`                | Logging level (`debug`, `info`, `warn`, `error`)                                        | `info`     |
+| `ARCHIVE_HISTORY_LIMIT`    | `-archive-history-limit`    | Number of most recent archives/snapshots to expose per-archive metrics for (both tools) | `10`       |
 
-Borg and restic are collected by two independent schedulers, each on its own refresh interval — a slow/WAN
-restic collection won't delay Borg's (or vice versa). If a config file has only one of the two repository
-types, only that tool's scheduler runs.
+The `4h` refresh intervals suit daily backups, whose metrics don't change often. Lower them if you back up more
+frequently. See [How collection works](#how-collection-works) for details.
 
-We decided to decouple metrics collection from the Prometheus `scrape_interval`, as collecting metrics can
-take some time, especially over multiple repositories or a slow backend.  
-That way, when Prometheus scrapes, we don't need to compute anything, just offer the latest "cached" metrics.
+### User and permissions
 
-The refresh intervals default to `4h`, but you can tweak them depending on your requirements, for instance
-depending on the frequency of your backups. This value is optimized for daily backups, for which metrics
-won't change frequently.  
-To try to run at that interval even if the computer sleeps/wakes up, the internal scheduler will regularly
-check if it's time to refresh. By default, this happens every 20 seconds, but you can tweak it with
-`SCHEDULER_CHECK_INTERVAL`.
+Run the exporter as a user that can read the borg/restic repositories, typically the user that runs the backups.
+For restic repositories using `password_command`, the command must run successfully and non-interactively as that
+same user.
 
-When a tool has multiple repositories configured, the exporter will not crash if it cannot retrieve metrics
-for one of them, but instead an error will be logged.  
-This is useful to already expose the metrics that it was able to gather.  
-In case of errors, if that tool's refresh interval is greater than 5 minutes, it will retry 5 times, waiting
-one minute between each try, before stopping and waiting for the next refresh.  
-This is to avoid potentially waiting for hours in case of a transient error.
+## Running it as a service
 
-### Migrating from borg-exporter
-
-This project was renamed from `borg-exporter` to `backup-exporter`, and its configuration was reworked from
-flags/env-only to the YAML file above, as part of adding restic support. There's no compatibility shim — this
-is a one-time breaking change:
-
-- Replace `BORG_REPOSITORIES`/`-borg-repositories` (comma-separated paths) and `BORG_OPTS`/`-borg-opts` with a
-  `repositories:` YAML file, one `type: borg` entry per repository, `opts:` set per-entry if needed.
-- `METRICS_REFRESH_INTERVAL`/`-metrics-refresh-interval` is now `BORG_REFRESH_INTERVAL`/`-borg-refresh-interval`.
-- The binary and systemd unit/service name changed from `borg-exporter` to `backup-exporter`.
-- `borg_collect_errors`, `borg_last_collect_error`, `borg_last_collect_duration_seconds`,
-  `borg_last_collect_timestamp` and `borg_system_info` were replaced by the shared `exporter_*` metrics above
-  (now labeled by `tool` too) — update any alerts/dashboards referencing the old names.
-
-## Installation
-
-You can install it by downloading the latest version and placing it in `/usr/local/bin/backup-exporter`.  
-Depending on your OS, you can then create a service to run it.  
-For instance, using systemd, you can create `/etc/systemd/system/backup-exporter.service` :
+With systemd, create `/etc/systemd/system/backup-exporter.service`:
 
 ```
 [Unit]
@@ -200,37 +132,26 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
-Then reload the systemd-daemon :
+If the backups belong to a non-root user, add `User=<that user>` under `[Service]`.
 
-`sudo systemctl daemon-reload`
-
-Then enable and start the service :
+Then reload systemd, and enable and start the service:
 
 ```
-sudo systemctl enable backup-exporter.service
-sudo systemctl start backup-exporter.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now backup-exporter.service
 ```
 
-You can check the logs with :
-
-`sudo journalctl -fu backup-exporter`
-
-If everything is correctly started, you should be able to check the metrics (after the initial collection which can
-take a few minutes) :
-
-`curl 127.0.0.1:9099/metrics`
-
-### User considerations
-
-The exporter should run with a user having access to the borg/restic repositories, typically the user
-executing the backups. For restic repositories using `password_command`, the command must be runnable
-(and succeed non-interactively) as that same user.
-
-### Prometheus
-
-To scrape the metrics from Prometheus, you can add a scrape configuration, for instance :
+Follow the logs with:
 
 ```
+sudo journalctl -fu backup-exporter
+```
+
+## Prometheus
+
+Add a scrape job for the exporter:
+
+```yaml
 - job_name: 'backup-exporter'
   scrape_interval: 3m
   scrape_timeout: 30s
@@ -239,45 +160,214 @@ To scrape the metrics from Prometheus, you can add a scrape configuration, for i
       - '<hostname>:9099'
 ```
 
-We set the `scrape_interval` to `3m`, as the exporter will by default only refresh them every 4 hours,
-but you can tweak this value depending on your requirements.  
-The advice is to keep it under `5m`, after which metrics are considered staled by Prometheus.
+Scraping is cheap: the exporter serves cached metrics, it doesn't run borg/restic on each scrape. Keep
+`scrape_interval` under `5m` though, otherwise Prometheus considers the series stale between scrapes.
 
-### Grafana dashboard
+For the [history dashboards](#grafana-dashboards), the longer your Prometheus retention, the further back you can
+look.
 
-You can import the dashboard from [the dashboards directory](./dashboards) in Grafana. It's split into a Borg
-section and a Restic section, each with a summary table across that tool's repositories, under which you can
-see details for each repository: an archive history table and size/files/duration bar charts for the last `N`
-archives/snapshots (see `ARCHIVE_HISTORY_LIMIT`), and exporter collection health. The two sections use
-different fields where the tools' metrics don't map onto each other (e.g. Borg's repository-level totals and
-its full-archive compressed/deduplicated size have no restic equivalent — see [Metrics](#metrics)).
+## Alerting
 
-Two more dashboards, `backup-exporter-borg-history.json` and `backup-exporter-restic-history.json` (uids
-`backup-exporter-borg-history` and `backup-exporter-restic-history`), show the long-term history of a single
-repository: backup size, files, duration, unique data added, backups per day, repository size on disk (Borg) and
-collection health. They're built from the `*_last_backup_*` and repository gauges rather than the per-archive ones,
-so they cover your Prometheus retention instead of only the last `N` archives, with gaps wherever the exporter
-wasn't scraped. Clicking a repository in the main dashboard's Borg or Restic summary table opens the matching one;
-import all three dashboards for those links to work.
+Some example Prometheus alerting rules to start from:
 
-The dashboard file was renamed from `borg-last-backups.json` to `backup-exporter.json` now that it covers both
-tools. Grafana UI imports (keyed by the dashboard's `uid`) are unaffected, but if you provision it by file path
-(e.g. GitOps-style), update the path.
+```yaml
+groups:
+  - name: backup-exporter
+    rules:
+      - alert: BackupTooOld
+        expr: (time() - borg_last_backup_timestamp) > 2 * 24 * 3600
+           or (time() - restic_last_backup_timestamp) > 2 * 24 * 3600
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backup too old: {{ $labels.repository }}"
+          description: "Last backup of {{ $labels.repository }} was {{ $value | humanizeDuration }} ago."
 
-![Grafana Dashboard](./dashboards/grafana-exporter-dashboard.png)
+      - alert: BackupCollectFailing
+        expr: exporter_last_collect_error == 1
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: "backup-exporter can't read {{ $labels.repository }} ({{ $labels.tool }})"
+          description: "Collection has been failing for 6h on {{ $labels.instance }}. Check the exporter logs."
 
-## Release
+      - alert: BackupSizeDropped
+        expr: borg_last_backup_original_size_bytes < 0.7 * (borg_last_backup_original_size_bytes offset 1d)
+           or restic_last_backup_original_size_bytes < 0.7 * (restic_last_backup_original_size_bytes offset 1d)
+        labels:
+          severity: info
+        annotations:
+          summary: "Backup of {{ $labels.repository }} shrank by more than 30% in a day"
+          description: "Could be a new exclude or deleted data, or files silently missing from the backup."
+```
 
-The application follows semantic versioning.  
-You can execute a release with :
+- **`BackupTooOld`** is the one that matters most. Set the threshold from your backup schedule: 2 days suits daily
+  backups, but will fire constantly for twice-weekly ones. If your repositories run on different schedules, add a
+  label per schedule in your scrape config (e.g. with `metric_relabel_configs` matching on `repository`) and write
+  one rule per label.
+- **`BackupCollectFailing`** uses a long `for:` so it doesn't flap on machines that sleep or leave the network, such
+  as laptops. The exporter retries failed collections on its own (see [How collection works](#how-collection-works)).
+- **`BackupSizeDropped`** catches the case where a backup still runs but stops including some data. It's often
+  intentional (a new exclude, deleted files), hence the `info` severity. It needs a sample from a day earlier, so it
+  won't fire for a drop that happens while the exporter isn't being scraped.
 
-`make release`
+An "exporter down" alert (`up{job="backup-exporter"} == 0`) is left out on purpose: it's noisy for machines that
+aren't always on, and `BackupTooOld` already catches what matters, backups that stopped.
 
-which will, by default, create a new `minor` version tag and push it.  
-The release pipeline will thus be triggered.
+## Grafana dashboards
 
-You can release a new patch or major version with :
+Import the dashboards from [the dashboards directory](./dashboards) into Grafana:
 
-`./release.sh <major|minor|patch>`
+- **`backup-exporter.json`**: the overview. It has a Borg section and a Restic section, each with a summary table
+  of that tool's repositories, then per-repository details: an archive history table, size/files/duration bar
+  charts for the last `N` archives/snapshots (see `ARCHIVE_HISTORY_LIMIT`), and the exporter's collection health.
+- **`backup-exporter-borg-history.json`** and **`backup-exporter-restic-history.json`**: the long-term history of a
+  single repository: backup size, files, duration, unique data added, backups per day, repository size on disk
+  (Borg only) and collection health. They cover your whole Prometheus retention instead of only the last `N`
+  archives, with gaps wherever the exporter wasn't scraped.
 
-You can dry-run the result (showing the tag that would be created) with the `--dry-run` flag.
+Clicking a repository in one of the overview's summary tables opens its history dashboard. Import all three
+dashboards for those links to work, and keep their `uid`s (`be2qvzcxrzh1ca`, `backup-exporter-borg-history` and
+`backup-exporter-restic-history`), since the links use them.
+
+Borg and restic panels show different fields where the tools' metrics don't map onto each other. For example,
+Borg's repository-level totals have no restic equivalent (see [Metrics](#metrics)).
+
+> The overview was previously named `borg-last-backups.json`. Grafana UI imports (keyed by `uid`) are unaffected,
+> but if you provision it by file path or URL (e.g. GitOps-style), update the path.
+
+## Metrics
+
+Every metric is labeled by `repository`, the `name` from the config file.
+
+There are two kinds of per-backup metrics:
+
+- **`*_last_backup_*`**: the latest backup only. Scraped over time, they build up a long-term history in
+  Prometheus, which is what the history dashboards use. That history starts when the exporter starts tracking a
+  repository.
+- **`*_archive_*`**: one series per archive/snapshot, for the last `N` of them (`ARCHIVE_HISTORY_LIMIT`, default
+  10), labeled additionally by `archive` (Borg archive name) or `snapshot` (restic short snapshot ID). These include
+  backups that predate the exporter, but only the most recent `N`.
+
+All timestamps are Unix epoch seconds.
+
+### Borg
+
+| Name                                       | Description                                    | Type  |
+|--------------------------------------------|------------------------------------------------|-------|
+| `borg_last_backup_duration_seconds`        | Duration of the last backup in seconds         | Gauge |
+| `borg_last_backup_compressed_size_bytes`   | Compressed size of the last backup in bytes    | Gauge |
+| `borg_last_backup_deduplicated_size_bytes` | Deduplicated size of the last backup in bytes* | Gauge |
+| `borg_last_backup_files`                   | Number of files in the last backup             | Gauge |
+| `borg_last_backup_original_size_bytes`     | Original size of the last backup in bytes      | Gauge |
+| `borg_last_backup_timestamp`               | Timestamp of the last backup                   | Gauge |
+| `borg_archive_duration_seconds`            | Duration of the archive's backup in seconds    | Gauge |
+| `borg_archive_compressed_size_bytes`       | Compressed size of the archive in bytes        | Gauge |
+| `borg_archive_deduplicated_size_bytes`     | Deduplicated size of the archive in bytes*     | Gauge |
+| `borg_archive_files`                       | Number of files in the archive                 | Gauge |
+| `borg_archive_original_size_bytes`         | Original size of the archive in bytes          | Gauge |
+| `borg_archive_timestamp`                   | Timestamp of the archive's backup              | Gauge |
+| `borg_total_chunks`                        | Repository total chunks                        | Gauge |
+| `borg_total_compressed_size_bytes`         | Repository total compressed size               | Gauge |
+| `borg_total_size_bytes`                    | Repository total size                          | Gauge |
+| `borg_total_unique_chunks`                 | Repository total unique chunks                 | Gauge |
+| `borg_deduplicated_compressed_size_bytes`  | Repository deduplicated compressed size        | Gauge |
+| `borg_deduplicated_size_bytes`             | Repository deduplicated size                   | Gauge |
+| `borg_last_archive_info`                   | Information about the last backup archive      | Gauge |
+| `borg_repository_info`                     | Information about the backup repository        | Gauge |
+
+\* This is *not* "the size of this backup after deduplication". Borg computes it as the data exclusively owned by
+this archive relative to the repository's current state, i.e. what would be freed if you deleted just this archive.
+It is order-dependent: it can read `0` for a large, valid backup whose content duplicates another archive, and can
+change for an older archive once newer ones are created. See the
+[borg documentation](https://borgbackup.readthedocs.io/en/stable/usage/info.html) for details.
+
+### Restic
+
+| Name                                         | Description                                                   | Type  |
+|----------------------------------------------|---------------------------------------------------------------|-------|
+| `restic_last_backup_duration_seconds`        | Duration of the last backup in seconds*                       | Gauge |
+| `restic_last_backup_original_size_bytes`     | Original (restore) size of the last backup in bytes           | Gauge |
+| `restic_last_backup_files`                   | Number of files in the last backup                            | Gauge |
+| `restic_last_backup_timestamp`               | Timestamp of the last backup                                  | Gauge |
+| `restic_last_backup_data_added_bytes`        | Uncompressed data added to the repository by the last backup* | Gauge |
+| `restic_last_backup_data_added_packed_bytes` | Compressed data added to the repository by the last backup*   | Gauge |
+| `restic_archive_duration_seconds`            | Duration of the snapshot's backup in seconds*                 | Gauge |
+| `restic_archive_original_size_bytes`         | Original (restore) size of the snapshot in bytes              | Gauge |
+| `restic_archive_files`                       | Number of files in the snapshot                               | Gauge |
+| `restic_archive_timestamp`                   | Timestamp of the snapshot's backup                            | Gauge |
+| `restic_archive_data_added_bytes`            | Uncompressed data added to the repository by this snapshot*   | Gauge |
+| `restic_archive_data_added_packed_bytes`     | Compressed data added to the repository by this snapshot*     | Gauge |
+| `restic_last_snapshot_info`                  | Information about the last backup snapshot                    | Gauge |
+
+\* restic only records this data (its snapshot "summary" block) from a version recent enough to capture it.
+Snapshots taken by an older restic, including ones that already existed before you upgraded, won't have these
+series. The exporter leaves them unset rather than reporting a fake `0`.
+
+There's no restic equivalent of Borg's chunk-level dedup stats (`borg_total_chunks` and friends) or repository
+info: restic's CLI doesn't expose them per repository, so they're left out rather than approximated.
+
+### Exporter
+
+These describe the exporter's own operation and are shared across tools. They're labeled by `tool` (`borg` or
+`restic`) and `repository`, except `exporter_system_info`, which is labeled by `tool`, `hostname` and `version`.
+
+| Name                                     | Description                                           | Type    |
+|------------------------------------------|-------------------------------------------------------|---------|
+| `exporter_collect_errors`                | Number of errors encountered while collecting metrics | Counter |
+| `exporter_last_collect_error`            | 1 if the last collection failed, 0 if successful      | Gauge   |
+| `exporter_last_collect_duration_seconds` | Duration of the last metrics collection               | Gauge   |
+| `exporter_last_collect_timestamp`        | Timestamp of the last metrics collection              | Gauge   |
+| `exporter_system_info`                   | Information about a configured backup tool            | Gauge   |
+
+## How collection works
+
+Collecting metrics can be slow, especially with many repositories or a slow backend, so it's decoupled from
+Prometheus scrapes. The exporter refreshes its metrics in the background on its own interval and serves the latest
+cached values on each scrape.
+
+- **Independent schedulers.** Borg and restic each have their own scheduler and refresh interval, so a slow (e.g.
+  WAN) restic collection doesn't delay Borg's, and vice versa. If the config only has one type of repository, only
+  that tool's scheduler runs.
+- **Sleep-friendly.** Rather than a fixed timer, each scheduler checks every `SCHEDULER_CHECK_INTERVAL` (default
+  `20s`) whether a refresh is due, so it keeps to its interval on machines that sleep and wake up.
+- **Partial failures.** If one repository can't be read, the error is logged and the other repositories' metrics are
+  still exposed. If the refresh interval is longer than 5 minutes, a failed collection is retried up to 5 times, one
+  minute apart, instead of waiting hours for the next refresh after a transient error.
+- **Restic size caching.** `restic_*_original_size_bytes` and `restic_*_files` come from
+  `restic stats <snapshot> --mode restore-size`, a separate and comparatively slow command per snapshot (especially
+  over a WAN/SFTP backend). The exporter caches these per snapshot and only computes them for snapshots it hasn't
+  seen before, plus the latest snapshot every cycle, since older snapshots' sizes don't change. Snapshots removed by
+  `forget`/`prune` are dropped from the cache too.
+
+## Migrating from borg-exporter
+
+This project was renamed from `borg-exporter` to `backup-exporter`, and its configuration moved from flags/env only
+to the YAML file above, as part of adding restic support. It's a one-time breaking change with no compatibility
+shim:
+
+- Replace `BORG_REPOSITORIES`/`-borg-repositories` (comma-separated paths) and `BORG_OPTS`/`-borg-opts` with a
+  `repositories:` YAML file, one `type: borg` entry per repository, with `opts:` set per entry if needed.
+- `METRICS_REFRESH_INTERVAL`/`-metrics-refresh-interval` is now `BORG_REFRESH_INTERVAL`/`-borg-refresh-interval`.
+- The binary and systemd unit/service name changed from `borg-exporter` to `backup-exporter`.
+- `borg_collect_errors`, `borg_last_collect_error`, `borg_last_collect_duration_seconds`,
+  `borg_last_collect_timestamp` and `borg_system_info` were replaced by the shared `exporter_*` metrics (now
+  labeled by `tool` too). Update any alerts/dashboards referencing the old names.
+- The overview dashboard file was renamed from `borg-last-backups.json` to `backup-exporter.json`.
+
+## Development and releases
+
+```
+make test     # run the tests
+make build    # build build/backup-exporter (linux/amd64)
+```
+
+The project follows semantic versioning. Releases are cut by pushing a tag, which triggers the release pipeline:
+
+```
+make release                              # new minor version
+./release.sh <major|minor|patch>          # pick the version part
+./release.sh <major|minor|patch> --dry-run # show the tag that would be created
+```
