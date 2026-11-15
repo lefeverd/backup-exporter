@@ -252,6 +252,14 @@ archives/snapshots (see `ARCHIVE_HISTORY_LIMIT`), and exporter collection health
 different fields where the tools' metrics don't map onto each other (e.g. Borg's repository-level totals and
 its full-archive compressed/deduplicated size have no restic equivalent — see [Metrics](#metrics)).
 
+Two more dashboards, `backup-exporter-borg-history.json` and `backup-exporter-restic-history.json` (uids
+`backup-exporter-borg-history` and `backup-exporter-restic-history`), show the long-term history of a single
+repository: backup size, files, duration, unique data added, backups per day, repository size on disk (Borg) and
+collection health. They're built from the `*_last_backup_*` and repository gauges rather than the per-archive ones,
+so they cover your Prometheus retention instead of only the last `N` archives, with gaps wherever the exporter
+wasn't scraped. Clicking a repository in the main dashboard's Borg or Restic summary table opens the matching one;
+import all three dashboards for those links to work.
+
 The dashboard file was renamed from `borg-last-backups.json` to `backup-exporter.json` now that it covers both
 tools. Grafana UI imports (keyed by the dashboard's `uid`) are unaffected, but if you provision it by file path
 (e.g. GitOps-style), update the path.

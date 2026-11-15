@@ -185,6 +185,20 @@
         },
         "overrides": [
           {
+            "matcher": { "id": "byName", "options": "Repository" },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "History for ${__value.raw}",
+                    "url": "/d/backup-exporter-borg-history?var-repository=${__value.raw:percentencode}"
+                  }
+                ]
+              }
+            ]
+          },
+          {
             "matcher": { "id": "byName", "options": "Raw Size" },
             "properties": [{ "id": "unit", "value": "decbytes" }, { "id": "custom.width", "value": 120 }]
           },
@@ -355,6 +369,20 @@
           "mappings": []
         },
         "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Repository" },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "History for ${__value.raw}",
+                    "url": "/d/backup-exporter-restic-history?var-repository=${__value.raw:percentencode}"
+                  }
+                ]
+              }
+            ]
+          },
           {
             "matcher": { "id": "byName", "options": "Last Original Size" },
             "properties": [{ "id": "unit", "value": "decbytes" }, { "id": "custom.width", "value": 120 }]
